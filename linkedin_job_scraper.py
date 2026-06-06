@@ -6,7 +6,7 @@ LinkedIn Visa-Sponsorship Job Scraper
 Scrapes software-engineering jobs across multiple countries using LinkedIn's
 PUBLIC guest endpoint (no login required -> won't get your account flagged),
 tags each job with a visa-sponsorship signal, and writes a clean Excel workbook
-with one sheet per country.
+AND an interactive HTML report, one sheet/tab per country.
 
 WHY THIS APPROACH
 -----------------
@@ -43,10 +43,9 @@ from openpyxl.utils import get_column_letter
 # How fresh should jobs be?
 # Use any number of hours: "1h", "6h", "12h", "24h", "48h", etc.
 # Or "week" for the last 7 days.
-TIME_WINDOW = "1h"
+TIME_WINDOW = "24h"
 
 # Countries to search. The "location" string is what LinkedIn matches against.
-# Add/remove freely. (geo_id is optional; left None we just use the location text.)
 COUNTRIES = [
     {"name": "Germany",     "location": "Germany"},
     {"name": "Spain",       "location": "Spain"},
@@ -71,8 +70,9 @@ ALSO_SEARCH_VISA_KEYWORD = True
 # this is what stops you wasting time on non-sponsoring roles. Recommended True.
 CHECK_DESCRIPTIONS = True
 
-# Output file
+# Output files
 OUTPUT_FILE = "linkedin_jobs.xlsx"
+HTML_OUTPUT_FILE = "linkedin_jobs.html"
 
 # Politeness / anti-rate-limit. Don't crank these down or LinkedIn will 429 you.
 PAGE_DELAY = (2.5, 4.5)      # seconds between paginated requests (randomised)
@@ -126,6 +126,26 @@ WEAK_VISA_TERMS = [
     "relocation", "relocate", "visa", "work permit", "sponsorship",
     "international candidates", "willing to relocate", "permit",
 ]
+
+# Words that, appearing just before a visa term, flip its meaning
+# ("we do NOT offer visa sponsorship" must not be tagged STRONG).
+NEGATORS = [
+    "no ", "not ", "without", "cannot", "can't", "unable",
+    "don't", "doesn't", "won't", "neither", "nor ", "never",
+    "unfortunately",
+]
+
+# The subset of terms that are specifically about *sponsorship*. When one of
+# these is negated ("no visa sponsorship", "we do not sponsor"), it's an
+# explicit rejection -> NO-SPONSOR, rather than mere silence -> NONE.
+# Generic words like "visa"/"relocation" are deliberately excluded so a phrase
+# like "no visa required" doesn't get mislabelled as a rejection.
+SPONSOR_TERMS = {
+    "visa sponsorship", "sponsor your visa", "we sponsor", "sponsorship available",
+    "will sponsor", "visa sponsor", "sponsored visa", "work permit sponsorship",
+    "visa support", "sponsor work visa", "sponsorship provided", "sponsorship",
+    "blue card", "skilled worker visa", "tier 2",
+}
 
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -203,17 +223,55 @@ def fetch_description(job_id):
         return ""
 
 
+def _negated(t, term):
+    """True only if EVERY occurrence of `term` is preceded by a negator."""
+    idx = t.find(term)
+    if idx == -1:
+        return False
+    while idx != -1:
+        window = t[max(0, idx - 35):idx]
+        if not any(neg in window for neg in NEGATORS):
+            return False          # a clean, non-negated mention exists
+        idx = t.find(term, idx + 1)
+    return True
+
+
 def visa_signal(text):
-    """Return 'STRONG', 'WEAK', or 'NONE' based on description text."""
+    """Classify a description's visa stance. Returns one of:
+
+      STRONG      - sponsorship clearly offered
+      WEAK        - visa / relocation mentioned in passing
+      NONE        - description read fine, but no visa language at all
+      NO-SPONSOR  - explicitly states it will NOT sponsor
+      UNKNOWN     - description couldn't be read (nothing to judge)
+
+    Negation-aware: a sponsorship term preceded by a negator
+    ('no visa sponsorship', 'we do not sponsor') is treated as an explicit
+    rejection (NO-SPONSOR), not as a positive signal. A clean positive
+    mention anywhere wins over a negated one.
+    """
     if not text:
         return "UNKNOWN"
+    t = text.lower()
+    found_negated_sponsor = False
+
     for term in STRONG_VISA_TERMS:
-        if term in text:
-            return "STRONG"
+        if term in t:
+            if _negated(t, term):
+                if term in SPONSOR_TERMS:
+                    found_negated_sponsor = True
+            else:
+                return "STRONG"
+
     for term in WEAK_VISA_TERMS:
-        if term in text:
-            return "WEAK"
-    return "NONE"
+        if term in t:
+            if _negated(t, term):
+                if term in SPONSOR_TERMS:
+                    found_negated_sponsor = True
+            else:
+                return "WEAK"
+
+    return "NO-SPONSOR" if found_negated_sponsor else "NONE"
 
 
 def search_one(keywords, location, tpr):
@@ -297,11 +355,13 @@ def scrape():
 # Excel output
 # =============================================================================
 
-VISA_ORDER = {"STRONG": 0, "WEAK": 1, "UNKNOWN": 2, "UNCHECKED": 2, "NONE": 3}
+VISA_ORDER = {"STRONG": 0, "WEAK": 1, "UNKNOWN": 2, "UNCHECKED": 2,
+              "NONE": 3, "NO-SPONSOR": 4}
 VISA_FILL = {
-    "STRONG": PatternFill("solid", fgColor="C6EFCE"),   # green
-    "WEAK":   PatternFill("solid", fgColor="FFEB9C"),   # amber
-    "NONE":   PatternFill("solid", fgColor="FFC7CE"),   # red
+    "STRONG":     PatternFill("solid", fgColor="C6EFCE"),   # green
+    "WEAK":       PatternFill("solid", fgColor="FFEB9C"),   # amber
+    "NONE":       PatternFill("solid", fgColor="FFC7CE"),   # light red (no signal)
+    "NO-SPONSOR": PatternFill("solid", fgColor="BFBFBF"),   # grey (explicitly ruled out)
 }
 HEADER_FILL = PatternFill("solid", fgColor="1F2937")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -380,19 +440,17 @@ def write_excel(results, window_label):
     print(f"\nDone. {total} jobs saved to {OUTPUT_FILE}")
 
 
-
 # =============================================================================
 # HTML output
 # =============================================================================
 
-HTML_OUTPUT_FILE = "linkedin_jobs.html"
-
 _VISA_BADGE = {
-    "STRONG":    ('<span class="badge badge-strong">&#10003; STRONG</span>', 0),
-    "WEAK":      ('<span class="badge badge-weak">&#9679; WEAK</span>',      1),
-    "UNKNOWN":   ('<span class="badge badge-unknown">? UNKNOWN</span>',      2),
-    "UNCHECKED": ('<span class="badge badge-unknown">&#8212; UNCHECKED</span>', 2),
-    "NONE":      ('<span class="badge badge-none">&#10007; NONE</span>',     3),
+    "STRONG":     ('<span class="badge badge-strong">&#10003; STRONG</span>', 0),
+    "WEAK":       ('<span class="badge badge-weak">&#9679; WEAK</span>',      1),
+    "UNKNOWN":    ('<span class="badge badge-unknown">? UNKNOWN</span>',      2),
+    "UNCHECKED":  ('<span class="badge badge-unknown">&#8212; UNCHECKED</span>', 2),
+    "NONE":       ('<span class="badge badge-none">&#10007; NONE</span>',     3),
+    "NO-SPONSOR": ('<span class="badge badge-nosponsor">&#8856; NO-SPONSOR</span>', 4),
 }
 
 _HTML_TEMPLATE = """\
@@ -411,6 +469,7 @@ _HTML_TEMPLATE = """\
     --strong-bg: #14532d; --strong-fg: #86efac;
     --weak-bg:   #713f12; --weak-fg:   #fde68a;
     --none-bg:   #7f1d1d; --none-fg:   #fca5a5;
+    --nosp-bg:   #111827; --nosp-fg:   #6b7280;
     --unk-bg:    #1e293b; --unk-fg:    #94a3b8;
     --radius: 8px; --font: "Inter", "Segoe UI", system-ui, sans-serif;
   }}
@@ -513,6 +572,7 @@ _HTML_TEMPLATE = """\
   .badge-strong {{ background: var(--strong-bg); color: var(--strong-fg); }}
   .badge-weak   {{ background: var(--weak-bg);   color: var(--weak-fg);   }}
   .badge-none   {{ background: var(--none-bg);   color: var(--none-fg);   }}
+  .badge-nosponsor {{ background: var(--nosp-bg); color: var(--nosp-fg); border: 1px solid #374151; text-decoration: line-through; }}
   .badge-unknown{{ background: var(--unk-bg);    color: var(--unk-fg); border: 1px solid var(--border); }}
 
   /* ---- empty state ---- */
@@ -534,7 +594,9 @@ _HTML_TEMPLATE = """\
     <button class="filter-btn active" data-visa="ALL"    onclick="setVisa(this)">All</button>
     <button class="filter-btn"        data-visa="STRONG" onclick="setVisa(this)">&#10003; Strong</button>
     <button class="filter-btn"        data-visa="WEAK"   onclick="setVisa(this)">&#9679; Weak</button>
+    <button class="filter-btn"        data-visa="UNKNOWN" onclick="setVisa(this)">? Unknown</button>
     <button class="filter-btn"        data-visa="NONE"   onclick="setVisa(this)">&#10007; None</button>
+    <button class="filter-btn"        data-visa="NO-SPONSOR" onclick="setVisa(this)">&#8856; No-sponsor</button>
   </div>
 </header>
 
@@ -583,12 +645,12 @@ function sortTable(thEl, colIdx) {{
   var rows   = Array.from(tbody.querySelectorAll("tr"));
   var asc    = thEl.dataset.asc !== "1";
   thEl.dataset.asc = asc ? "1" : "0";
-  table.querySelectorAll("th").forEach(function(t) {{ t.classList.remove("sorted"); t.querySelector(".sort-icon").textContent = " &#8597;"; }});
+  table.querySelectorAll("th").forEach(function(t) {{ t.classList.remove("sorted"); var ic = t.querySelector(".sort-icon"); if (ic) ic.textContent = " \\u2195"; }});
   thEl.classList.add("sorted");
-  thEl.querySelector(".sort-icon").textContent = asc ? " &#8593;" : " &#8595;";
+  thEl.querySelector(".sort-icon").textContent = asc ? " \\u2191" : " \\u2193";
   rows.sort(function(a, b) {{
-    var av = a.querySelectorAll("td")[colIdx]?.textContent.trim() || "";
-    var bv = b.querySelectorAll("td")[colIdx]?.textContent.trim() || "";
+    var av = a.querySelectorAll("td")[colIdx] ? a.querySelectorAll("td")[colIdx].textContent.trim() : "";
+    var bv = b.querySelectorAll("td")[colIdx] ? b.querySelectorAll("td")[colIdx].textContent.trim() : "";
     return asc ? av.localeCompare(bv) : bv.localeCompare(av);
   }});
   rows.forEach(function(r) {{ tbody.appendChild(r); }});
@@ -605,6 +667,7 @@ _PANEL_TEMPLATE = """\
     <div class="stat"><strong style="color:var(--strong-fg)">{n_strong}</strong>Strong visa</div>
     <div class="stat"><strong style="color:var(--weak-fg)">{n_weak}</strong>Weak signal</div>
     <div class="stat"><strong style="color:var(--none-fg)">{n_none}</strong>No signal</div>
+    <div class="stat"><strong style="color:var(--nosp-fg)">{n_nosp}</strong>Ruled out</div>
   </div>
   <div class="table-wrap">
     <table>
@@ -655,6 +718,7 @@ def write_html(results, window_label):
         n_strong = sum(1 for j in jobs if j.get("visa") == "STRONG")
         n_weak   = sum(1 for j in jobs if j.get("visa") == "WEAK")
         n_none   = sum(1 for j in jobs if j.get("visa") == "NONE")
+        n_nosp   = sum(1 for j in jobs if j.get("visa") == "NO-SPONSOR")
 
         # Tab button
         tab_parts.append(
@@ -693,6 +757,7 @@ def write_html(results, window_label):
             n_strong=n_strong,
             n_weak=n_weak,
             n_none=n_none,
+            n_nosp=n_nosp,
             rows_html="\n".join(rows) if rows else
                       '        <tr><td colspan="6" class="empty">No jobs found</td></tr>',
         ))
